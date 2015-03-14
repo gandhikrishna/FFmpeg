@@ -188,11 +188,37 @@ typedef struct ALSChannelData {
 } ALSChannelData;
 
 
+typedef struct DiffFloatData {
+    int use_acf;
+    int acf_flag[1000];
+    int acf_mantissa[1000];
+    int highest_byte[1000];
+    int partA_flag[1000];
+    int shift_amp[1000];
+    int shift_value[1000];
+    int last_acf_mantissa[1000];
+    int last_shift_value[1000];
+} DiffFloatData;
+
+typedef struct DiffMantissa {
+    int int_zero[1000][1000];
+    int mantissa[1000][1000];
+    int compressed_flag[1000];
+    int nchars;
+    int float_data[1000][1000];
+    int nbits[1000][1000];
+    int d[1000][1000];
+    int f[1000][1000];
+} DiffMantissa;
+
+
 typedef struct ALSDecContext {
     AVCodecContext *avctx;
     ALSSpecificConfig sconf;
     GetBitContext gb;
     BswapDSPContext bdsp;
+    DiffFloatData df;
+    DiffMantissa dm;
     const AVCRC *crc_table;
     uint32_t crc_org;               ///< CRC value of the original input data
     uint32_t crc;                   ///< CRC value calculated from decoded data
@@ -1318,6 +1344,223 @@ static int revert_channel_correlation(ALSDecContext *ctx, ALSBlockData *bd,
 }
 
 
+int static int_float_con(ALSDecContext *ctx,int c)
+{
+    ALSSpecificConfig *sconf = &ctx->sconf;
+    DiffFloatData *df = &ctx->df;
+    DiffMantissa *dm = &ctx->dm;
+    unsigned int n;
+    long long multi;
+    if(df->acf_mantissa[c] == 0) {
+        for(n=0; n<sconf->frame_length; n++){
+            if(dm->int_zero[c][n]) {
+                dm->f[c][n] = dm->float_data[c][n]; 
+            }
+            else{
+                if(df->shift_amp[c]) {
+                    dm->f[c][n]=(float)((1 << df->shift_value[c])/(1 << 23));
+                    dm->f[c][n]=(0x0800000 | dm->f[c][n]) + dm->d[c][n]; 
+                }
+            }   
+        }
+    }
+
+    else {
+        for(n=0; n<sconf->frame_length; n++){
+            if(dm->int_zero[c][n]) {
+                dm->f[c][n] = dm->float_data[c][n]; 
+            }
+            else {
+                if(df->shift_amp[c]) {          
+                    dm->f[c][n]=(float)((1 << df->shift_value[c])/(1 << 23));
+                    multi = ( df->acf_mantissa[c] | 0x0800000 )*( dm->f[c][n] | 0x0800000 );
+                    dm->f[c][n]= multi >> 41;
+                    dm->f[c][n]= dm->f[c][n] + 0xb000000;
+                    dm->f[c][n]=(0x0800000 | dm->f[c][n]) + dm->d[c][n]; 
+                }
+            }
+        }
+
+    }
+    return 0;
+}
+
+
+static int read_diff_mantissa(ALSDecContext *ctx,int c)
+{   
+    ALSSpecificConfig *sconf = &ctx->sconf;
+    DiffFloatData *df = &ctx->df;
+    DiffMantissa *dm = &ctx->dm;
+    unsigned int n;
+    unsigned int nchars;
+    unsigned int wordlen;
+    if(df->acf_mantissa[c]==0) {
+        if(df->partA_flag[c] != 0) {
+            if(dm->compressed_flag[c] == 0) {
+                for(n=0; n<sconf->frame_length; n++) {
+                    if(dm->int_zero[c][n]) {
+                        dm->f[c][n] = dm->float_data[c][n];
+                    }
+                }
+            }
+            else{
+                nchars=0;
+                for(n=0; n< sconf->frame_length; n++){
+                    if(dm->int_zero[c][n]){
+                        nchars += 4;
+                        wordlen=23-n;
+                        if (wordlen > df->highest_byte[c]*8) {
+                            dm->nbits[c][n]=df->highest_byte[c]*8;
+                        }
+                        else {
+                            dm->nbits[c][n]=wordlen;
+                        }
+                    }
+
+                }
+
+            // TODO: decompression if compressed_flag=1;
+
+            }
+
+        }
+        if(df->highest_byte[c] !=0){
+            if(dm->compressed_flag[c] == 0) {
+                for(n=0; n<sconf->frame_length; n++) {
+                    if(dm->int_zero[c][n]==0) {
+                        dm->d[c][n] = dm->mantissa[c][n];
+                        int_float_con(ctx,c);
+                    }
+
+                }
+            }
+            else {
+                nchars=0;
+                for(n=0; n<sconf->frame_length; n++) {
+                    if(dm->int_zero[c][n]==0) {
+                        nchars += (int )dm->nbits[c][n]/8;
+                        if((dm->nbits[c][n] % 8)>0)
+                            nchars++;
+                        wordlen=23-n;
+                        if (wordlen > df->highest_byte[c]*8) {
+                            dm->nbits[c][n]=df->highest_byte[c]*8;
+                        }
+                        else {
+                            dm->nbits[c][n]=wordlen;
+                        }
+                    }   
+                }
+            // TODO: decompression if compressed_flag=1;
+            }
+
+        }
+    }
+    else {
+        if(df->partA_flag[c] != 0) {
+            if(dm->compressed_flag[c] == 0) {
+                for(n=0; n<sconf->frame_length; n++) {
+                    if(dm->int_zero[c][n]) {
+                        dm->f[c][n] = dm->float_data[c][n];
+                    }
+                }
+            }
+            else{
+                nchars=0;
+                for(n=0; n< sconf->frame_length; n++){
+                    if(dm->int_zero[c][n]){
+                        nchars += 4;
+                        wordlen=23;
+                        if (wordlen > df->highest_byte[c]*8) {
+                            dm->nbits[c][n]=df->highest_byte[c]*8;
+                        }
+                        else {
+                            dm->nbits[c][n]=wordlen;
+                        }
+                    }
+                }
+            // TODO: decompression if compressed_flag=1;
+            }
+        }
+        if(df->highest_byte[c] !=0){
+            if(dm->compressed_flag[c] == 0) {
+                for(n=0; n<sconf->frame_length; n++) {
+                    if(dm->int_zero[c][n]==0) {
+                        dm->d[c][n] = dm->mantissa[c][n];
+                        int_float_con(ctx,c);
+                    }
+
+                }
+            }
+            else {
+                nchars=0;
+                for(n=0; n<sconf->frame_length; n++) {
+                    if(dm->int_zero[c][n]==0) {
+                        nchars += (int )dm->nbits[c][n]/8;
+                        if((dm->nbits[c][n] % 8)>0)
+                            nchars++;
+                        wordlen=23;
+                        if (wordlen > df->highest_byte[c]*8) {
+                            dm->nbits[c][n]=df->highest_byte[c]*8;
+                        }
+                        else {
+                            dm->nbits[c][n]=wordlen;
+                        }
+                    }   
+                }
+            // TODO: decompression if compressed_flag=1;
+            }
+
+        }
+
+
+
+    }
+    return 0;
+
+}
+
+
+static int read_diff_float_data(ALSDecContext *ctx)
+{   
+    ALSSpecificConfig *sconf = &ctx->sconf;
+    AVCodecContext *avctx    = ctx->avctx;
+    DiffFloatData *df = &ctx->df;
+    unsigned int c;
+    if(sconf->ra_distance) {
+        for (c = 0; c < avctx->channels; c++) {
+            df->last_acf_mantissa[c]=0;
+            df->last_shift_value[c]=0;
+        }
+    }
+    for (c = 0; c < avctx->channels; c++) {
+        if(df->use_acf) {
+            if(df->acf_flag[c]) {
+                df->last_acf_mantissa[c] = df->acf_mantissa[c];
+            }
+
+            else {
+                df->acf_mantissa[c] = df->last_acf_mantissa[c];
+            }
+        }
+        else {
+            df->acf_mantissa[c] = 0;
+            df->last_acf_mantissa[c] = 0;
+        }
+        if(df->shift_amp) {
+            df->last_shift_value[c] = df->shift_value[c];
+        }
+        else {
+            df->shift_value[c] = df->last_shift_value[c];    
+        }
+        read_diff_mantissa(ctx,c);
+        df->last_acf_mantissa[c] = df->acf_mantissa[c];
+        df->last_shift_value[c] = df->shift_value[c];
+    }
+    return 0;
+
+}
+
+
 /** Read the frame data.
  */
 static int read_frame_data(ALSDecContext *ctx, unsigned int ra_frame)
@@ -1460,7 +1703,9 @@ static int read_frame_data(ALSDecContext *ctx, unsigned int ra_frame)
     }
 
     // TODO: read_diff_float_data
-
+    if(sconf->floating) {
+        read_diff_float_data(ctx);
+    }
     return 0;
 }
 
